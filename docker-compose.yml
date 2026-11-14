@@ -1,0 +1,126 @@
+services:
+  ml-db:
+    image: postgres:17-alpine
+    container_name: projeto-si-ml-db
+    environment:
+      POSTGRES_DB: ${ML_POSTGRES_DB:-keystroke_biometrics}
+      POSTGRES_USER: ${ML_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${ML_POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ml_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ML_POSTGRES_USER:-postgres} -d ${ML_POSTGRES_DB:-keystroke_biometrics}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - keystroke-network
+    restart: unless-stopped
+
+  ml-api:
+    build:
+      context: ./projeto_si_ml_api
+      dockerfile: Dockerfile
+    container_name: projeto-si-ml-api
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-django-insecure-docker-secret-key}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-False}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,api,ml-api}
+      DATABASE_URL: postgres://${ML_POSTGRES_USER:-postgres}:${ML_POSTGRES_PASSWORD:-postgres}@ml-db:5432/${ML_POSTGRES_DB:-keystroke_biometrics}
+      BIOMETRICS_MODELS_DIR: /app/models_data
+    ports:
+      - "${ML_API_PORT:-8000}:8000"
+    volumes:
+      - ml_models_data:/app/models_data
+    depends_on:
+      ml-db:
+        condition: service_healthy
+    networks:
+      keystroke-network:
+        aliases:
+          - api
+    restart: unless-stopped
+
+  ml-scheduler:
+    build:
+      context: ./projeto_si_ml_api
+      dockerfile: Dockerfile
+    container_name: projeto-si-ml-scheduler
+    command: ["sh", "-c", "python manage.py migrate --noinput && python manage.py run_scheduler"]
+    environment:
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:-django-insecure-docker-secret-key}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-False}
+      DATABASE_URL: postgres://${ML_POSTGRES_USER:-postgres}:${ML_POSTGRES_PASSWORD:-postgres}@ml-db:5432/${ML_POSTGRES_DB:-keystroke_biometrics}
+      BIOMETRICS_MODELS_DIR: /app/models_data
+    volumes:
+      - ml_models_data:/app/models_data
+    depends_on:
+      ml-db:
+        condition: service_healthy
+    networks:
+      - keystroke-network
+    restart: unless-stopped
+
+  backend-db:
+    image: postgres:17-alpine
+    container_name: projeto-si-backend-db
+    environment:
+      POSTGRES_DB: ${BACKEND_POSTGRES_DB:-projeto_si}
+      POSTGRES_USER: ${BACKEND_POSTGRES_USER:-projeto_si}
+      POSTGRES_PASSWORD: ${BACKEND_POSTGRES_PASSWORD:-projeto_si_dev}
+    volumes:
+      - backend_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BACKEND_POSTGRES_USER:-projeto_si} -d ${BACKEND_POSTGRES_DB:-projeto_si}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - keystroke-network
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./projeto-si-backend
+      dockerfile: Dockerfile
+    container_name: projeto-si-backend
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      ASPNETCORE_HTTP_PORTS: "5000"
+      ConnectionStrings__Postgres: Host=backend-db;Port=5432;Database=${BACKEND_POSTGRES_DB:-projeto_si};Username=${BACKEND_POSTGRES_USER:-projeto_si};Password=${BACKEND_POSTGRES_PASSWORD:-projeto_si_dev}
+      Banco__AplicarMigracoesNaInicializacao: "true"
+      Jwt__Chave: ${JWT_SECRET_KEY:-chave-apenas-para-desenvolvimento-nao-usar-em-producao-0123456789}
+    ports:
+      - "${BACKEND_PORT:-5000}:5000"
+    depends_on:
+      backend-db:
+        condition: service_healthy
+    networks:
+      keystroke-network:
+        aliases:
+          - mock-api
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./projeto_si_frontend
+      dockerfile: Dockerfile
+    container_name: projeto-si-frontend
+    ports:
+      - "${FRONTEND_PORT:-4200}:80"
+    depends_on:
+      - backend
+      - ml-api
+    networks:
+      - keystroke-network
+    restart: unless-stopped
+
+volumes:
+  ml_postgres_data:
+  ml_models_data:
+  backend_postgres_data:
+
+networks:
+  keystroke-network:
+    name: keystroke-network
+    driver: bridge
