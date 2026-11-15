@@ -88,12 +88,17 @@ Você pode sobrescrever os valores padrão definindo variáveis no ambiente ou e
 | `JWT_SECRET_KEY` | `chave-apenas-para-desenvolvimento-nao-usar-em-producao-0123456789` |
 | `DJANGO_SECRET_KEY` | `django-insecure-docker-secret-key` |
 | `DJANGO_DEBUG` | `False` |
+| `DEBUG_LOGS` | `true` (padrão no Compose; `false` em builds/configurações de produção) |
+| `BIOMETRICS_DEBUG_LOGS` | `${DEBUG_LOGS:-true}` (sobrepõe `DEBUG_LOGS` na ML API e no `ml-scheduler`) |
 
 ### Comandos Úteis (Docker)
 
 ```bash
-# Acompanhar logs
+# Acompanhar logs (backend, ml-api e ml-scheduler em JSON estruturado no stdout; frontend via console do navegador)
 docker compose logs -f
+
+# Subir com debug logs desativados (modo produção)
+DEBUG_LOGS=false ASPNETCORE_ENVIRONMENT=Production docker compose up --build
 
 # Executar retreinamento manual pela ML API
 docker compose exec ml-api python manage.py retrain_models
