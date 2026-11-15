@@ -1,12 +1,16 @@
 [submodule "projeto-si-backend"]
 	path = projeto-si-backend
 	url = git@github.com:caiquecr7/projeto-si-backend.git
+	branch = main
 [submodule "projeto_si_frontend"]
 	path = projeto_si_frontend
 	url = https://github.com/Thiago-Fernandes-Dias/projeto_si_frontend.git
+	branch = main
 [submodule "projeto_si_experimentos"]
 	path = projeto_si_experimentos
 	url = https://github.com/Thiago-Fernandes-Dias/projeto_si_experimentos.git
+	branch = master
 [submodule "projeto_si_ml_api"]
 	path = projeto_si_ml_api
 	url = git@github.com:Thiago-Fernandes-Dias/projeto_si_ml_api.git
+	branch = main
