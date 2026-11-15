@@ -4,9 +4,6 @@
 [submodule "projeto_si_frontend"]
 	path = projeto_si_frontend
 	url = https://github.com/Thiago-Fernandes-Dias/projeto_si_frontend.git
-[submodule "projeto_si_descricao"]
-	path = projeto_si_descricao
-	url = https://github.com/Thiago-Fernandes-Dias/projeto_si_descricao.git
 [submodule "projeto_si_experimentos"]
 	path = projeto_si_experimentos
 	url = https://github.com/Thiago-Fernandes-Dias/projeto_si_experimentos.git
