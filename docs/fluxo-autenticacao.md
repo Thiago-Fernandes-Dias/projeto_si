@@ -1,6 +1,8 @@
-# Fluxo de Cadastro, Enrollment e Login
+# Fluxo de Cadastro, Enrollment, Login e Troca de Senha
 
-Documentação detalhada da comunicação, persistência e validações entre **Frontend (`projeto_si_frontend`)**, **Backend .NET (`projeto-si-backend`)** e **ML API (`projeto_si_ml_api`)** após a remoção de impostores sintéticos, desacoplamento do cadastro/senha na ML API e validação/mascaramento de `features` no backend.
+Documentação detalhada da comunicação, persistência e validações entre **Frontend (`projeto_si_frontend`)**, **Backend .NET (`projeto-si-backend`)** e **ML API (`projeto_si_ml_api`)**.
+
+O desenho atual usa **treinamento one-class** (somente amostras genuínas), cadastro unificado no backend, features mascaradas como vetor posicional e o classificador **`M2005_IDB`** na ML API. A ML API não cadastra usuários, não lê nem verifica senhas e não escreve novas linhas em `amostras`.
 
 ---
 
@@ -8,218 +10,224 @@ Documentação detalhada da comunicação, persistência e validações entre **
 
 | Módulo | Responsabilidades no Fluxo | Acesso ao Banco (`projeto_si`) |
 |---|---|---|
-| `projeto_si_frontend` (Angular 18) | UI (`/register`, `/enrollment`, `/login`), captura de teclas (`KEY_DOWN`/`KEY_UP`), cálculo local de `features` (`computeSample`) e roteamento de sessão (`/session` ou `/blocked`). | Nenhum (envia requisições `/api/*` via proxy para o Backend .NET). |
-| `projeto-si-backend` (.NET 10) | Ponto de entrada `/api/*`, cadastro e hash de senha (`PBKDF2-HMAC-SHA512`), bloqueio por tentativas, validação das `features` contra a senha esperada, mascaramento posicional, persistência em `usuarios`/`amostras` e emissão de JWT. | Leitura e escrita em `usuarios` e `amostras`. |
-| `projeto_si_ml_api` (Django + DRF) | Treinamento inicial (`M2005Alg` *one-class*, somente amostras genuínas), inferência biométrica, sinalização `shouldRecordForRetraining` e retreinamento periódico (`run_scheduler` / `retrain_models`). Não lê nem verifica senhas e não expõe `/api/register`. | Leitura de `usuarios` e `amostras`; escrita apenas em `modelos` (+ `.joblib`/SHA-256 em disco). |
+| `projeto_si_frontend` (Angular 18) | UI (`/register`, `/enrollment`, `/change-password`, `/login`, `/session`, `/blocked`), captura de teclas (`KEY_DOWN`/`KEY_UP`) com `performance.now()`, cálculo local de `H`/`DD`/`UD` (`computeSample`) e roteamento de sessão. | Nenhum (envia requisições `/api/*` para o Backend .NET). |
+| `projeto-si-backend` (.NET 10) | Ponto de entrada `/api/*`, cadastro, troca de senha, hash PBKDF2, bloqueio por tentativas, validação das `features` contra a senha, mascaramento posicional, persistência em `usuarios`/`amostras`, JWT e chamadas à ML API. | Leitura/escrita em `usuarios` e `amostras`; leitura dos `modelos` retornados pela ML API. |
+| `projeto_si_ml_api` (Django + DRF) | Treinamento inicial (`M2005_IDB` one-class), inferência biométrica, calibração de limiar, sinalização `shouldRecordForRetraining`, retreinamento incremental/periódico e rollback de modelos. Não lê nem verifica senhas e não expõe `/api/register`. | Leitura de `usuarios` e `amostras`; escrita apenas em `modelos` (+ `.joblib`/SHA-256 em disco). |
 
-```mermaid
-sequenceDiagram
-    actor U as "Usuario (Browser)"
-    participant FE as "Frontend (Angular)"
-    participant BE as "Backend (.NET)"
-    participant DB as "PostgreSQL"
-    participant ML as "ML API (Django)"
+### Algoritmo de decisão
 
-    rect rgb(240, 248, 255)
-        Note over U,ML: "1. Cadastro (/register -> POST /api/register)"
-        U->>FE: Preenche username, senha e confirmacao
-        FE->>BE: POST /api/register
-        BE->>BE: Normaliza nome, valida senha (8-64) e gera PBKDF2
-        BE->>DB: INSERT INTO usuarios (biometria_cadastrada_em = NULL)
-        BE-->>FE: 201 Created
-    end
+- **`M2005_IDB`** (`AdaptiveM2005Alg`, `variant="idb"`): média aritmética de um submodelo deslizante (janela de 50 amostras genuínas) e de um submodelo crescente incremental (Welford, memória `O(1)`).
+- **Limiar por usuário:** calibrado com `min`/`min_non_outlier` sobre os scores da galeria genuína, limitado ao teto `0.7`, com recalibração dinâmica após retreinamento.
+- **Resultado experimental:** CMU `BACC = 0.8909`, `FRR = 15.24%`, `FAR = 6.58%`; KeyRecs `BACC = 0.7980`, `FRR = 9.03%`, `FAR = 31.37%` (52 experimentos em `projeto_si_experimentos`).
 
-    rect rgb(245, 255, 245)
-        Note over U,ML: "2. Enrollment (/enrollment -> POST /api/enrollment)"
-        loop "5 repeticoes da senha"
-            U->>FE: Digita senha + Enter
-            FE->>FE: computeSample() gera features em ordem cronologica
-        end
-        FE->>BE: POST /api/enrollment (5 samples)
-        BE->>BE: Valida senha, totalDurationMs >= 0 e TentarExtrair(features, senha)
-        BE->>BE: Mascara formato para H.0, DD.0.1, UD.0.1, ... (double[])
-        BE->>DB: INSERT 5 amostras (Origem=Cadastro) + UPDATE biometria_cadastrada_em
-        BE->>ML: POST /api/enrollment (vectors, recordSamples=false)
-        ML->>ML: Valida 5 vetores (3n-2 >= 4) e treina M2005Alg genuino
-        ML->>DB: INSERT modelos (v1) + grava .joblib/.meta.json
-        ML-->>BE: 201 Created (modelId, modelVersion=1)
-        BE-->>FE: 200 OK
-    end
+---
 
-    rect rgb(255, 248, 240)
-        Note over U,ML: "3. Login (/login -> POST /api/authenticate)"
-        U->>FE: Digita username + senha + Enter
-        FE->>FE: computeSample(1) gera features da tentativa
-        FE->>BE: POST /api/authenticate
-        BE->>BE: Valida TentarExtrair(features, passwordAttempt), bloqueio, senha e biometria
-        BE->>ML: POST /api/authenticate (vector, recordSample=false)
-        ML->>ML: Valida dimensao/limites, verifica SHA-256 do .joblib e infere score
-        ML-->>BE: 200 OK (decision, confidence, threshold, shouldRecordForRetraining)
-        alt "shouldRecordForRetraining == true"
-            BE->>DB: INSERT amostra (Origem=Login, double[] mascarado)
-        end
-        alt "decision == GENUINE"
-            BE->>DB: Zera tentativas_falhas
-            BE-->>FE: 200 OK (GENUINE + JWT 60 min)
-        else "decision == IMPOSTOR"
-            BE->>DB: Incrementa tentativas_falhas (bloqueia 15 min apos 5)
-            BE-->>FE: 200 OK (IMPOSTOR)
-        end
-    end
+## 1. Cadastro e Enrollment
+
+### 1.1. Pré-checagem de username no frontend
+
+- **Arquivo:** `projeto_si_frontend/src/app/features/register/register.component.ts` e `src/app/core/services/biometric-api.service.ts`.
+- O `RegisterComponent` valida localmente:
+  - username normalizado (`trim` + minúsculas) com 3–50 caracteres e apenas `a-z`, `0-9`, `.`, `_`, `@`, `+`, `-`;
+  - senha com 8–64 caracteres, sem letras acentuadas nem teclas mortas (`´`, `` ` ``, `~`, `^`, `¨`);
+  - confirmação igual à senha.
+- Em seguida chama `GET /api/username-availability?username=...`.
+  - `200 { username, available }`: se `available=true`, o usuário e a senha-alvo ficam em memória no `UserSessionService` e a navegação segue para `/enrollment`.
+  - Se indisponível, o formulário permanece com mensagem de erro.
+- A disponibilidade é apenas uma pré-checagem: a unicidade é garantida novamente por `POST /api/register` (`409` em corrida).
+
+### 1.2. Coleta das 5 amostras no frontend
+
+- **Arquivos:** `src/app/shared/components/keystroke-input/keystroke-input.component.ts`, `src/app/core/services/keystroke-capture.service.ts`, `src/app/features/enrollment/enrollment.component.ts`.
+- A captura usa `performance.now()` e registra `{ key, code, timestamp, eventType: 'KEY_DOWN' | 'KEY_UP' }`.
+- O texto é registrado apenas no `KEY_DOWN`. O par `KEY_DOWN`/`KEY_UP` é associado pela tecla física (`code`), não pelo caractere, para que soltar `Shift` antes da letra não invalide a amostra.
+- São recusados/reiniciados: `Backspace`, `Delete`, setas/Home/End, colagem, teclas mortas (`Dead`), `keydown` repetido e `KEY_UP` órfão.
+- `computeSample(repetition, targetPassword)`:
+  - exige texto não vazio, igual à senha-alvo e exatamente `2 × quantidade de caracteres` eventos;
+  - valida a alternância `KEY_DOWN → KEY_UP → KEY_DOWN` (rejeita sobreposição);
+  - calcula `H` (hold), `DD` (down-down) e `UD` (up-down) em segundos com 4 casas;
+  - gera chaves com sufixo sequencial anti-colisão (`H.t.0`, `DD.t.e.0`, `UD.t.e.0`, ...);
+  - recusa localmente `H`/`DD` fora de `(0, 5]` s;
+  - retorna `{ repetition, features, rawTimings, textEntered, totalDurationMs }`.
+- A tela exige exatamente 5 repetições válidas. Ao concluir a 5ª, bloqueia o campo e envia o lote assim que possível; depois de sucesso, o usuário clica para ir ao login.
+
+### 1.3. Cadastro unificado no backend
+
+- **Arquivo:** `projeto-si-backend/src/ProjetoSi.Api/Features/Cadastro/CadastrarUsuario.cs`.
+- Request: `{ username, password, samples[5] }`.
+- Validações:
+  - username normalizado e regex `^[a-z0-9._@+-]{3,50}$` (`400` se inválido);
+  - senha de 8 a 64 caracteres (`400`);
+  - exatamente `Biometria:AmostrasCadastro = 5` amostras (`400`);
+  - todas as amostras com o mesmo `textEntered` e exatamente igual a `password` (`400`);
+  - `totalDurationMs` finito e `>= 0` (`400`);
+  - `VetorCaracteristicas.TentarExtrair(features, senha)` valida chaves, ordem cronológica e limites (`400` se falhar):
+    - `H`/`DD` ∈ `(0, 5]` s;
+    - `UD` ∈ `[-5, 5]` s;
+    - quantidade de features `3n - 2`.
+- Persistência:
+  - hash da senha via `PasswordHasher<Usuario>` (PBKDF2-HMAC-SHA512, salt por usuário);
+  - `usuarios` com `data_mudanca_senha = agora` e `biometria_cadastrada_em = agora`;
+  - `amostras` com `origem = Cadastro`, `vetor = double[]` posicional mascado (`H.0, DD.0.1, UD.0.1, ...`), `repeticao`, `duracao_total_ms` e `coletada_em`;
+  - nunca grava caracteres da senha, `textEntered` nem `rawTimings`.
+- Depois de salvar, chama a ML API:
+
+```json
+POST /api/enrollment
+{
+  "username": "thiago_dias",
+  "userId": "0199f3a0-6f2b-7c3e-8a41-123456789abc",
+  "vectors": [[...], [...], [...], [...], [...]]
+}
 ```
 
----
+- Se o treinamento falhar, o backend remove amostras e usuário (`ReverterCadastroAsync`) e propaga o erro; nenhum cadastro parcial permanece.
+- Sucesso: `201 Created` com `{ success, message, samplesRegistered: 5, calculatedAverageHoldMs }`.
 
-## 1. Fluxo de Cadastro de Usuário (`/register` → `POST /api/register`)
+### 1.4. Enrollment na ML API
 
-### 1.1. Frontend (`RegisterComponent` e `BiometricApiService`)
-- **Arquivo:** `projeto_si_frontend/src/app/features/register/register.component.ts` e `src/app/core/services/biometric-api.service.ts`.
-- **Validações locais no `onSubmit()`:**
-  - `username.trim()` não pode ser vazio.
-  - `password` não pode ser vazio e deve ter `password.length >= 4`.
-  - `password === confirmPassword`.
-- **Requisição enviada:** `POST /api/register` com `{ username: this.username.trim(), targetPassword: this.password, confirmPassword: this.confirmPassword }`.
-- **Pós-resposta (`201`):** salva usuário e senha-alvo em memória no `UserSessionService` (`registerUser`) e navega para `/enrollment`.
-
-### 1.2. Backend .NET (`CadastrarUsuario`)
-- **Arquivo:** `projeto-si-backend/src/ProjetoSi.Api/Features/Cadastro/CadastrarUsuario.cs` e `src/ProjetoSi.Api/Domain/NomeUsuario.cs`.
-- **Validações:**
-  - `Username` não vazio após espaços e `TargetPassword` não vazio.
-  - Normaliza `Username` (`Trim().ToLowerInvariant()`) e exige regex `^[a-z0-9._@+-]{3,50}$` (`400 BadRequest` se inválido).
-  - Tamanho de `TargetPassword` entre `TamanhoMinimoSenha = 8` e `TamanhoMaximoSenha = 64` caracteres (`400`).
-  - `TargetPassword == ConfirmPassword` (`400`).
-  - Unicidade de `Nome` em `usuarios` (`409 Conflict` se já existir ou ocorrer `UniqueViolation` no PostgreSQL).
-- **Persistência e resposta:** gera o hash com `IPasswordHasher<Usuario>` (ASP.NET Identity `PBKDF2`), cria o registro em `usuarios` (`BiometriaCadastradaEm = null`, `DataMudancaSenha = agora`) e retorna `201 Created`.
-
-### 1.3. API de ML
-- **Arquivo:** `projeto_si_ml_api/biometrics/urls.py`.
-- A ML API **não** possui endpoint de registro (`POST /api/register` retorna `404`), não armazena nem lê `senha_hash` e assume que o usuário já foi criado pelo `projeto-si-backend` na tabela `usuarios`.
+- **Arquivos:** `projeto_si_ml_api/biometrics/serializers.py`, `views.py`, `services.py`, `ml/features.py`, `ml/training.py`, `ml/registry.py`.
+- `EnrollmentRequestSerializer` exige `username` **ou** `userId` e `vectors` não vazio.
+- `enroll_user`:
+  - busca o usuário existente (senão `404`);
+  - rejeita enrollment duplicado para a senha vigente (`criado_em >= data_mudanca_senha`, `409`);
+  - exige exatamente 5 vetores (`ENROLLMENT_SAMPLES`);
+  - valida cada vetor posicional: `len >= 4`, `(len + 2) % 3 == 0`, finitos, limites por slot e mesma dimensão;
+  - treina **apenas com os vetores genuínos** o `AdaptiveM2005Alg` configurado (`M2005_IDB` por padrão, `window_size=50`, `threshold=0.7`, `threshold_method=min_non_outlier`, `dynamic_threshold=True`);
+  - persiste `.joblib` com SHA-256, `.meta.json`, `active_version.json` e o registro `v1` em `modelos`;
+  - **não** escreve em `amostras` e **não** altera `usuarios`.
+- Resposta `201`: `{ userId, username, modelId, modelVersion, featureCount, samplesRegistered, calculatedAverageHoldMs, success, message }`.
 
 ---
 
-## 2. Fluxo de Enrollment Biométrico (`/enrollment` → `POST /api/enrollment`)
+## 2. Troca de Senha
 
-### 2.1. Captura e Montagem da Requisição no Frontend
-- **Arquivos:**
-  - `projeto_si_frontend/src/app/shared/components/keystroke-input/keystroke-input.component.ts`
-  - `projeto_si_frontend/src/app/core/services/keystroke-capture.service.ts`
-  - `projeto_si_frontend/src/app/features/enrollment/enrollment.component.ts`
-- **Captura (`KeystrokeInputComponent` + `KeystrokeCaptureService`):**
-  - Ao focar o campo (`onFocus`), inicia a captura (`startRecording`).
-  - No `paste` (`handlePaste`), bloqueia a colagem (`preventDefault()`), reseta o buffer e define `lastAnomaly`.
-  - No `keydown` (`handleKeyDown`):
-    - Ignora repetições de tecla segurada (`event.repeat`).
-    - Reseta o buffer e registra anomalia caso o usuário pressione `Backspace`, `Delete`, `ArrowLeft`, `ArrowRight`, `ArrowUp`, `ArrowDown`, `Home` ou `End`.
-    - Ignora teclas modificadoras (`Shift`, `Control`, `Alt`, `Meta`, `CapsLock`).
-    - Registra `{ key, code, timestamp: performance.now(), eventType: 'KEY_DOWN' }` e concatena `event.key` em `currentText`.
-  - No `keyup` (`handleKeyUp`), ignorando modificadores e `Enter`, registra `{ key, code, timestamp: performance.now(), eventType: 'KEY_UP' }`.
-  - Ao pressionar `Enter` com `currentText.length > 0`, `KeystrokeInputComponent` emite `textSubmitted`.
-- **Extração (`computeSample(repetition, targetPassword)`):**
-  - Exige `textEntered.length > 0` e `textEntered === targetPassword`.
-  - Exige `keyEventLog.length === textEntered.length * 2` e alternância estrita `KEY_DOWN(i) → KEY_UP(i+1) → KEY_DOWN(i+2)` (rejeita sobreposição de teclas / `UD < 0`).
-  - Normaliza nomes de tecla via `normalizeKeyName(key)`: `'.' → 'period'`, `'5' → 'five'`, `'Enter' → 'Return'`, `'A'..'Z' → 'Shift.' + minúscula`.
-  - Calcula as features em segundos (`toFixed(4)`) na ordem cronológica de digitação:
-    `H.<k0>.0, DD.<k0>.<k1>.0, UD.<k0>.<k1>.0, H.<k1>.<cnt>, ..., H.<k_{n-1}>.<cnt>`
-    e calcula `totalDurationMs` (`toFixed(2)`).
-  - Retorna `KeystrokeSample`: `{ repetition, features, rawTimings, textEntered, totalDurationMs }`.
-- **Envio (`EnrollmentComponent`):**
-  - Coleta `totalRequiredRepetitions = 5` repetições válidas.
-  - Envia `POST /api/enrollment` com `{ username, passwordLength, samplesCount, samples }`.
+### 2.1. Frontend
 
-### 2.2. Validação, Mascaramento e Persistência no Backend .NET
-- **Arquivos:**
-  - `projeto-si-backend/src/ProjetoSi.Api/Common/Biometria/AmostraDigitacaoRequest.cs`
-  - `projeto-si-backend/src/ProjetoSi.Api/Common/Biometria/VetorCaracteristicas.cs`
-  - `projeto-si-backend/src/ProjetoSi.Api/Features/Cadastro/RegistrarAmostrasCadastro.cs`
-  - `projeto-si-backend/src/ProjetoSi.Api/Common/Biometria/VerificadorBiometricoMlApi.cs`
-- **Validações da requisição (`RegistrarAmostrasCadastro`):**
-  - `Username` obrigatório (`400`).
-  - `Samples` deve conter exatamente `Biometria:AmostrasCadastro` (`5` em `appsettings.json`) itens (`400`).
-  - Todas as amostras devem possuir o mesmo `TextEntered` não vazio (`senhaDigitada`) (`400`).
-  - `rawTimings` é ignorado na desserialização (`AmostraDigitacaoRequest` recebe apenas `Repetition`, `Features`, `TextEntered`, `TotalDurationMs`).
-  - Para cada amostra:
-    - `TotalDurationMs` deve ser finito e `>= 0` (`400`).
-    - `VetorCaracteristicas.TentarExtrair(amostra.Features, senhaDigitada, out var vetor)` valida (`400` se falhar):
-      - `senhaDigitada.Length` entre `MinimoTeclas = 2` e `MaximoTeclas = 128`;
-      - `DeterminarIntervalosEsperados(senhaDigitada)` gera a sequência exata de `3n - 2` chaves esperada por `computeSample`;
-      - `Features.Count == esperadas.Count` e cada chave na ordem da requisição corresponde exatamente a `esperadas[indice]` (`StringComparer.Ordinal`);
-      - cada valor é finito (`double.IsFinite`), com `H` e `DD` em `(0, 5]` segundos e `UD` em `[-5, 5]` segundos.
-- **Validações de estado e credencial do usuário:**
-  - Busca usuário por `NomeUsuario.Normalizar(request.Username)`.
-  - Se `PossuiBiometria == true`: retorna `409 Conflict`.
-  - Se `EstaBloqueado(agora)`: retorna `401 Unauthorized`.
-  - Verifica `verificadorSenha.Verificar(usuario, senhaDigitada)`: se falhar e o usuário existir, contabiliza falha (`RegistrarFalha`) e retorna `401 Unauthorized`.
-- **Mascaramento e persistência em banco (`amostras`):**
-  - `VetorCaracteristicas.FormatoMascarado` (`FormatoPosicionalPara`) mapeia as dimensões para o formato posicional `H.0, DD.0.1, UD.0.1, H.1, ..., H.{n-1}`, removendo letras e padrões de repetição.
-  - `Amostra.DeCadastro` grava no PostgreSQL apenas `Vetor = vetor.Valores` (`double precision[]`), `Origem = Cadastro`, `Repeticao`, `DuracaoTotalMs` e `ColetadaEm` — sem nunca gravar chaves nominais, caracteres da senha ou `rawTimings`.
-  - Atualiza `BiometriaCadastradaEm = agora`, zera falhas (`RegistrarSucesso`) e salva no PostgreSQL.
-- **Chamada à ML API:** envia `POST /api/enrollment` para a ML API com `{ username, userId, vectors, recordSamples: false }` (apenas os `5` vetores numéricos puros).
+- **Rota:** `/change-password` (`ChangePasswordComponent`).
+- Campos: usuário, senha atual, nova senha e confirmação. Validações: usuário no padrão do cadastro, nova senha 8–64 sem acentos, confirmação igual e nova senha diferente da atual.
+- Após a validação, o `UserSessionService.startPasswordChange(...)` guarda usuário, senha atual e nova senha-alvo em memória e navega para `/enrollment`.
+- A coleta captura **5 repetições da nova senha** e envia `POST /api/change-password` em vez de `POST /api/register`.
 
-### 2.3. Treinamento Inicial na API de ML (`POST /api/enrollment`)
-- **Arquivos:** `projeto_si_ml_api/biometrics/serializers.py`, `biometrics/views.py`, `biometrics/services.py`, `biometrics/ml/features.py`, `biometrics/ml/training.py`, `biometrics/ml/registry.py`.
-- **Validações:**
-  - `EnrollmentRequestSerializer` exige `username` ou `userId` (`400`).
-  - `enroll_user` verifica existência de `Usuario` (`404`) e ausência de `ModeloBiometrico` para `criado_em >= user.data_mudanca_senha` (`409`).
-  - Valida os `5` (`ENROLLMENT_SAMPLES`) vetores recebidos via `validate_vector`: tamanho `>= 4` com `(len + 2) % 3 == 0` (`3n - 2`), finitos, mesma dimensão entre si, `H, DD ∈ (0, 5]` e `UD ∈ [-5, 5]` (`400`). (Também aceita `samples` com `features`/`rawTimings` ou fallback de leitura em `amostras` caso chamada diretamente sem `vectors`.)
-- **Treinamento e persistência:**
-  - Constrói schema posicional `H.0, DD.0.1, UD.0.1, ...` (`positional_schema`) e treina `M2005Alg` (`window_strategy="sliding"`, `window_size=50`, `threshold_method="min_non_outlier"`, `dynamic_threshold=True`, `threshold=0.7`) **exclusivamente com os vetores genuínos**, sem geração de impostores sintéticos.
-  - Salva `.joblib` com hash SHA-256 embutido no nome, `.meta.json`, `active_version.json` e o registro `v1` na tabela `modelos`, retornando `201 Created`.
-  - **Não** escreve em `amostras` e **não** altera `usuarios`.
+### 2.2. Backend
+
+- **Arquivo:** `projeto-si-backend/src/ProjetoSi.Api/Features/Senha/AlterarSenha.cs`.
+- Request: `{ username, currentPassword, newPassword, samples[5] }`.
+- Validações:
+  - `currentPassword` obrigatória (`400`);
+  - `newPassword` e `samples` com as mesmas regras do cadastro (`400`);
+  - `newPassword !== currentPassword` (`400`);
+  - conta bloqueada ou senha atual incorreta → `401` (contabilizando falha);
+  - usuário inexistente ou senha atual inválida → `401` sem revelar qual campo falhou.
+- Transação:
+  1. salva o hash anterior, `data_mudanca_senha` e `biometria_cadastrada_em` para compensação;
+  2. `AlterarSenha(novoHash, agora)` atualiza hash, `data_mudanca_senha` e zera `biometria_cadastrada_em`;
+  3. grava as 5 amostras da nova senha (`origem = Cadastro`);
+  4. chama a ML API (`POST /api/enrollment`) para treinar o novo modelo;
+  5. em sucesso, conclui a biometria e retorna `200` com `{ success, message, samplesRegistered: 5, calculatedAverageHoldMs }`.
+- Em falha do treinamento:
+  1. chama `POST /api/models/rollback` com `createdAfter = nova data de mudança`;
+  2. remove as amostras novas;
+  3. restaura hash, `data_mudanca_senha` e `biometria_cadastrada_em` anteriores;
+  4. retorna `502` informando que a senha anterior foi restaurada.
+- Concorrência: `DbUpdateConcurrencyException` retorna `409`.
+- JWT: a claim `pwd` é comparada com `data_mudanca_senha` em `GET /api/session`; tokens emitidos antes da troca passam a ser recusados (`401`).
+
+### 2.3. ML API e isolamento de modelos
+
+- **Arquivo:** `projeto_si_ml_api/biometrics/services.py`.
+- `get_active_model` considera apenas versões com `criado_em >= usuarios.data_mudanca_senha`; não há fallback para modelos antigos.
+- `activate_model_version` rejeita versões anteriores à troca, e `retrain_user` não reutiliza a galeria de um modelo pré-troca.
+- `POST /api/models/rollback` remove modelos criados após o timestamp informado, restaura `active_version.json` para a versão anterior e limpa o cache de modelos.
 
 ---
 
-## 3. Fluxo de Login e Retreinamento (`/login` → `POST /api/authenticate`)
+## 3. Login e Retreinamento
 
-### 3.1. Captura no Frontend (`LoginComponent`)
-- **Arquivos:** `projeto_si_frontend/src/app/features/login/login.component.ts` e `src/app/core/services/auth.service.ts`.
-- Ao submeter (`Enter` no `KeystrokeInputComponent` ou clique de login), chama `captureService.computeSample(1)` (sem `targetPassword`, validando a integridade local da digitação).
-- Envia `POST /api/authenticate` com `{ username, passwordAttempt, sample }`.
-- Se `decision === 'GENUINE'`, grava a sessão no `localStorage` (`keystrokeAuthSession`) e navega para `/session` (protegida por `authGuard`); se `decision === 'IMPOSTOR'`, registra tentativa bloqueada e navega para `/blocked` (protegida por `blockedAttemptGuard`).
+### 3.1. Frontend
 
-### 3.2. Validação, Orquestração e Persistência Seletiva no Backend .NET
-- **Arquivos:** `projeto-si-backend/src/ProjetoSi.Api/Features/Login/Autenticar.cs` e `src/ProjetoSi.Api/Common/Biometria/VerificadorBiometricoMlApi.cs`.
-- **Validações da requisição (`Autenticar`):**
-  - `Username` e `PasswordAttempt` não vazios (`400`).
-  - `Sample` presente com `TotalDurationMs` finito e `>= 0` (`400`).
-  - Se `Sample.TextEntered` não for nulo/vazio, exige igualdade exata com `PasswordAttempt` (`StringComparison.Ordinal`) (`400`).
-  - Executa `VetorCaracteristicas.TentarExtrair(amostra.Features, request.PasswordAttempt, out var tentativa)` para garantir chaves exatas, ordem cronológica correta para `PasswordAttempt` e limites `(0, 5]` / `[-5, 5]` (`400`).
-- **Validações de segurança do usuário:**
-  - Busca usuário por nome normalizado.
-  - Se bloqueado (`EstaBloqueado(agora)` — `MaximoTentativas = 5`, `MinutosBloqueio = 15`), se `verificadorSenha.Verificar` falhar (contabilizando falha) ou se `!usuario.PossuiBiometria`: retorna `200 OK` com `decision: "INVALID_CREDENTIALS"`.
-- **Chamada à ML API e persistência condicional:**
-  - Envia `POST /api/authenticate` para a ML API com `{ username, userId, vector: tentativa.Valores, recordSample: false }`.
-  - Lê `shouldRecordForRetraining` (`DeveGravarParaRetreino`) da resposta da ML API e **só adiciona** `Amostra.DeLogin` em `amostras` (apenas o `double[]` posicional mascarado, `DuracaoTotalMs`, `Decisao`, `Confianca` e `ModeloId`) quando `DeveGravarParaRetreino == true`.
-  - Se `Decisao == Genuine`: chama `usuario.RegistrarSucesso()` e gera JWT (`GeradorToken`, `MinutosExpiracao = 60` em `appsettings.json`).
-  - Se `Decisao == Impostor`: chama `usuario.RegistrarFalha(...)` (bloqueando por `15` min ao atingir `5` falhas).
-  - Salva alterações no PostgreSQL (`409 Conflict` em `DbUpdateConcurrencyException`) e retorna `200 OK` com `decision`, `confidenceScore`, `thresholdScore`, `inferenceTimeMs`, `message`, `userAverageHoldTimeMs`, `attemptAverageHoldTimeMs`, `accessToken` e `accessTokenExpiresAt`.
+- **Arquivo:** `src/app/features/login/login.component.ts`.
+- O usuário informa username e digita a senha; `computeSample(1)` gera a amostra da tentativa (sem exigir senha-alvo).
+- `POST /api/authenticate` com `{ username, passwordAttempt, sample }`.
+- Decisões:
+  - `GENUINE`: salva a sessão (incluindo `accessToken`) em `localStorage` e navega para `/session`;
+  - `IMPOSTOR`: guarda a tentativa em memória e navega para `/blocked`;
+  - `INVALID_CREDENTIALS`: exibe a mensagem da API e permanece no login.
+- `authGuard` valida `GET /api/session` com `Authorization: Bearer <token>` antes de abrir `/session`; token ausente/expirado ou emitido antes de uma troca de senha encerra a sessão local e redireciona para `/login`.
 
-### 3.3. Inferência e Elegibilidade na API de ML (`POST /api/authenticate`)
-- **Arquivos:** `projeto_si_ml_api/biometrics/serializers.py`, `biometrics/views.py`, `biometrics/services.py`, `biometrics/ml/inference.py`, `config/settings.py`.
-- **Proteção e validações:**
-  - Rate limit `ScopedRateThrottle` (`authenticate`, padrão `120/minute`).
-  - `AuthenticateRequestSerializer` exige `username` ou `userId` e pelo menos um entre `vector`, `features` ou `rawTimings` (`400`).
-  - `authenticate_user` não lê nem verifica senha; verifica existência de `Usuario` (`404`) e de `ModeloBiometrico` ativo para `criado_em >= data_mudanca_senha` (`409`).
-  - Carrega o modelo via `load_model` validando o **hash SHA-256** do arquivo `.joblib` antes da desserialização (`500` se adulterado).
-  - Valida `vector` com `validate_vector` (`3n - 2 >= 4` e limites por slot) e verifica se `len(pos_vector) == len(estimator.feature_names_)` (`400` se incompatível; quando chamada diretamente com `features`, exige também ordem/chaves exatas).
-- **Classificação e retorno:**
-  - Classifica apenas contra o perfil genuíno (`M2005Alg`), calcula `sample_label = label_for(confidence, threshold)` com margem `LABEL_CONFIDENCE_MARGIN = 0.15` em torno do limiar do modelo (`DECISION_THRESHOLD = 0.7`):
-    - `GENUINE` se `confidence >= threshold + 0.15`;
-    - `IMPOSTOR` se `confidence <= threshold - 0.15`;
-    - `UNCERTAIN` na faixa intermediária.
-  - Define `shouldRecordForRetraining = (decision == "GENUINE" and sample_label == "GENUINE")` e retorna `200 OK` **sem escrever nada em `amostras`**.
+### 3.2. Backend
 
-### 3.4. Retreinamento Adaptativo (`run_scheduler` / `retrain_models`)
-- **Arquivos:** `projeto_si_ml_api/biometrics/management/commands/run_scheduler.py`, `retrain_models.py`, `biometrics/services.py`.
-- O worker `run_scheduler` executa periodicamente a cada `RETRAIN_INTERVAL_MINUTES = 60` minutos (também acionável via `python manage.py retrain_models`).
-- `retrain_user` adquire lock concorrente (`select_for_update(skip_locked=True)`) e **apenas consulta** `amostras` (`coletada_em >= data_mudanca_senha`):
-  - Sem `--force`, exige pelo menos `RETRAIN_MIN_NEW_SAMPLES = 5` novas amostras `Login` com `decisao = "Genuine"` e `confianca >= base_threshold + 0.15` posteriores ao `criado_em` do modelo ativo.
-  - Seleciona a janela deslizante de até `RETRAIN_GENUINE_WINDOW = 50` amostras mais recentes dentre `Cadastro` e `Login` elegíveis (`Genuine` de alta confiança), ignorando amostras `Impostor` e incertas.
-  - Reajusta o `M2005Alg` (`sliding` + `min_non_outlier`) e persiste a próxima versão em `modelos` + `.joblib`/SHA-256 + `active_version.json`.
+- **Arquivo:** `projeto-si-backend/src/ProjetoSi.Api/Features/Login/Autenticar.cs`.
+- Validações:
+  - `username` e `passwordAttempt` obrigatórios (`400`);
+  - `sample` presente com `totalDurationMs` finito e `>= 0` (`400`);
+  - se `sample.textEntered` estiver preenchido, precisa ser igual a `passwordAttempt` (`400`);
+  - features exatas para a senha, na ordem correta e com limites de tempo (`400`).
+- Segurança:
+  - conta bloqueada (`5` falhas / `15` min) → `200` com `INVALID_CREDENTIALS`;
+  - senha textual inválida → contabiliza falha e retorna `200` com `INVALID_CREDENTIALS`;
+  - usuário sem biometria → `200` com `INVALID_CREDENTIALS`;
+  - concorrência → `409`.
+- Chamada à ML API e persistência:
+  - `POST /api/authenticate` com `{ username, userId, vector }`;
+  - se `shouldRecordForRetraining == true`, persiste a amostra de login (`origem = Login`, vetor posicional, decisão, confiança, modelo);
+  - `GENUINE` → zera falhas, gera JWT e retorna `accessToken`/`accessTokenExpiresAt`;
+  - `IMPOSTOR` → contabiliza falha e retorna sem token.
+- Resposta `200`: `decision`, `confidenceScore`, `thresholdScore`, `inferenceTimeMs`, `message`, `userAverageHoldTimeMs`, `attemptAverageHoldTimeMs`, `accessToken`, `accessTokenExpiresAt`.
+
+### 3.3. ML API
+
+- **Arquivos:** `biometrics/services.py`, `ml/inference.py`, `ml/registry.py`, `ml/features.py`.
+- `AuthenticateRequestSerializer` exige `username` ou `userId` e `vector`.
+- `authenticate_user`:
+  - busca o usuário (`404`) e o modelo ativo pós-troca de senha (`409`);
+  - carrega o `.joblib` validando SHA-256 (erro de integridade → `500`);
+  - valida o vetor posicional `3n - 2` e a dimensão esperada (`400`);
+  - classifica com `M2005_IDB`, usando o limiar calibrado do modelo;
+  - calcula `label_for(confidence, threshold)` com margem `0.15`;
+  - retorna `shouldRecordForRetraining = (decision == GENUINE and label == GENUINE)`;
+  - **não grava nada em `amostras`**.
+- Rate limit: `ScopedRateThrottle` (`120/minute` por padrão; configurável por `BIOMETRICS_AUTH_THROTTLE_RATE`).
+
+### 3.4. Retreinamento
+
+- **Arquivos:** `biometrics/management/commands/run_scheduler.py`, `retrain_models.py`, `biometrics/services.py`.
+- O scheduler executa a cada `RETRAIN_INTERVAL_MINUTES` (`60` por padrão); também é possível rodar manualmente:
+  ```bash
+  python manage.py retrain_models
+  python manage.py retrain_models --username thiago_dias --force
+  ```
+- `retrain_user`:
+  - adquire `select_for_update(skip_locked=True)`;
+  - exige, sem `--force`, pelo menos `RETRAIN_MIN_NEW_SAMPLES = 5` amostras `Login` `Genuine` com `confianca >= threshold + 0.15` posteriores ao modelo ativo;
+  - usa apenas `Cadastro` e `Login` `Genuine` de alta confiança; ignora `Impostor` e `UNCERTAIN`;
+  - se o modelo ativo é `AdaptiveM2005Alg` da mesma variante, faz **adaptação incremental** (novas amostras + Welford + janela deslizante);
+  - caso contrário, reconstrói o modelo a partir da janela de até `RETRAIN_GENUINE_WINDOW = 50` amostras genuínas;
+  - persiste a próxima versão em `modelos` + `.joblib`/SHA-256 + `active_version.json`.
+- A ML API apenas **lê** `amostras`; a gravação de novas linhas no login é exclusiva do Backend .NET.
 
 ---
 
-## Pontos de Atenção Atuais no Contrato Entre Módulos
+## 4. Persistência e Integridade dos Modelos
 
-- **Tamanho mínimo de senha no cadastro:** o frontend (`RegisterComponent`) aceita `>= 4` caracteres, mas o backend (`CadastrarUsuario`) exige `8` a `64` caracteres (`400 BadRequest` para senhas de `4` a `7` caracteres).
-- **Sobreposição de teclas (`UD < 0`):** `KeystrokeCaptureService.computeSample` bloqueia localmente digitação sobreposta exigindo `KEY_DOWN → KEY_UP → KEY_DOWN`, embora o backend (`VetorCaracteristicas.TentarExtrair`) e a ML API (`validate_vector`) aceitem `UD ∈ [-5, 5]` segundos.
-- **Campo `rawTimings` no payload:** o frontend continua incluindo `rawTimings` em `KeystrokeSample`, mas `AmostraDigitacaoRequest` no backend ignora esse campo e utiliza exclusivamente `Features` (validado contra a senha) e `TotalDurationMs`.
+- Diretório: `models_data/<user_id>/v<version>.joblib`; cada versão tem `.meta.json` e hash SHA-256 registrado em `modelos`.
+- A versão ativa é a maior `versao` com `criado_em >= data_mudanca_senha`, respeitando `active_version.json`.
+- `activate_model <username> <version>` permite rollback/ativação manual:
+  ```bash
+  python manage.py activate_model thiago_dias 1
+  ```
+- O endpoint interno `POST /api/models/rollback` existe para compensar falha na troca de senha; ele assume a rede Docker privada (ver "Melhorias Futuras" em `projeto_si_ml_api/requisitos.md`).
+- A gravação do arquivo é atômica e a falha de banco dispara compensação dos arquivos, evitando modelos órfãos.
+
+---
+
+## 5. Pontos de Atenção no Contrato Entre Módulos
+
+- **`rawTimings`:** o frontend inclui `rawTimings` em `KeystrokeSample`, mas o backend o ignora (`AmostraDigitacaoRequest` usa apenas `Repetition`, `Features`, `TextEntered` e `TotalDurationMs`). Nada de `rawTimings` é persistido; a ML API recebe somente vetores posicionais.
+- **Sobreposição de teclas (`UD < 0`):** o frontend exige `KEY_DOWN → KEY_UP → KEY_DOWN` e recusa sobreposição; o backend e a ML API aceitam matematicamente `UD ∈ [-5, 5]` s. A restrição mais forte é a do frontend.
+- **Senha:** o frontend e o backend aplicam as mesmas regras (8–64 caracteres, sem acentos); a mensagem de erro do backend é exibida na UI.
+- **Username:** a pré-checagem é apenas informativa; a unicidade real é garantida por `POST /api/register` (`409`).
+- **Credenciais inválidas no login:** o backend retorna `200` com `decision: "INVALID_CREDENTIALS"` em vez de `401`, para não revelar se o usuário existe.
+- **JWT:** só é emitido em decisão `GENUINE`; após troca de senha, tokens antigos são recusados por `GET /api/session`.
+- **ML API sem cadastro:** `POST /api/register` na ML API responde `404`; o cadastro é exclusividade do backend.
+- **Portas:** no Docker da raiz, o backend é publicado em `http://localhost:5001` (interno `backend:5000`), a ML API em `8000` e o frontend em `4200`. No desenvolvimento local do backend, a API escuta em `5000` (alvo padrão do `proxy.conf.json`).
