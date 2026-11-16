@@ -19,7 +19,7 @@ O repositório principal orquestra os seguintes submódulos:
 
 1. O **Frontend** calcula localmente as `features` (em ordem cronológica via `computeSample`) e envia ao **Backend .NET** (`/api`). Antes de iniciar a coleta, consulta `GET /api/username-availability`.
 2. No cadastro, o **Backend .NET** recebe username, senha e as 5 amostras em `POST /api/register`, valida credenciais e features, persiste usuário + amostras e chama a **ML API** (`POST /api/enrollment`) para treinar o modelo inicial. Se o treinamento falhar, o cadastro é revertido.
-3. No login, o **Backend .NET** valida a senha textual, confere se as chaves e a ordem das `features` correspondem exatamente à senha, converte/mascara para o vetor posicional CMU (`double[]`) e delega a inferência à **ML API** (`POST /api/authenticate`).
+3. No login, o **Backend .NET** valida a senha textual, confere se as chaves e a ordem das `features` correspondem exatamente à senha, converte/mascara para o vetor posicional (`double[]`) e delega a inferência à **ML API** (`POST /api/authenticate`).
 4. A **ML API** cria/consulta `modelos` + artefatos `.joblib` (SHA-256), apenas lê `amostras` (sem criar linhas) e retorna `decision`, `confidence`, `threshold`, `inferenceTimeMs` e `shouldRecordForRetraining`. O **Backend .NET** usa essa flag para persistir a amostra de login no **PostgreSQL compartilhado** apenas quando ela é genuína e confiável.
 5. Na troca de senha (`POST /api/change-password`), o Backend invalida a biometria anterior (`data_mudanca_senha`), coleta 5 amostras da nova senha, treina o novo modelo de forma síncrona e, em caso de falha, restaura senha/credenciais e remove os modelos criados após a troca.
 
@@ -35,11 +35,11 @@ O classificador de produção é o **`M2005_IDB`** — *Improved Double Parallel
 - **Submodelo crescente incremental (Welford):** acumula média e desvio-padrão em memória constante `O(1)` sobre todo o histórico genuíno desde o cadastro, evitando deriva e esquecimento catastrófico.
 - **Escore final:** média aritmética dos escores dos dois submodelos. Cada atributo recebe *hit* quando cai no intervalo de tolerância construído a partir de média/mediana/desvio-padrão do dígrafo.
 - **Limiar por usuário:** calibrado a partir dos scores da galeria genuína com `min` ou `min_non_outlier` (descarta scores abaixo de `média - 2.5 × desvio-padrão`), limitado ao teto base `0.7`. A recalibração ocorre a cada retreinamento (`dynamic_threshold=True`).
-- **Treinamento One-Class:** utiliza exclusivamente amostras genuínas do próprio usuário (sem impostores sintéticos). Amostras `IMPOSTOR` e `UNCERTAIN` não entram no retreinamento.
+- **Treinamento One-Class:** utiliza exclusivamente amostras genuínas do próprio usuário (*anomaly detector*). Amostras de impostores e `UNCERTAIN` não entram no retreinamento.
 
 ### Resultados que embasaram a escolha
 
-A escolha foi feita a partir dos 52 experimentos do `projeto_si_experimentos` (`results/exp_metric_averages.csv`), priorizando BACC e equilíbrio entre FRR/FAR:
+A escolha foi feita a partir dos 52 experimentos do `projeto_si_experimentos` (consolidados localmente em `results/exp_metric_averages.csv` por `generate_exp_metric_averages.py`), priorizando BACC e equilíbrio entre FRR/FAR:
 
 | Algoritmo | BACC CMU | FRR CMU | FAR CMU | BACC KeyRecs | FRR KeyRecs | FAR KeyRecs | BACC médio |
 |---|---|---|---|---|---|---|---|
@@ -300,6 +300,7 @@ pytest -v
 ## Documentação Adicional
 
 - [docs/fluxo-autenticacao.md](docs/fluxo-autenticacao.md): fluxo detalhado de cadastro, enrollment, login, troca de senha, retreinamento e rollback entre Frontend, Backend e ML API.
+- [`projeto-si-backend/README.md`](projeto-si-backend/README.md): execução, configuração, endpoints e decisões de modelagem do Backend .NET.
 - [`projeto_si_ml_api/requisitos.md`](projeto_si_ml_api/requisitos.md): especificação funcional e não funcional da ML API, incluindo a formulação do `M2005_IDB`.
 - [`projeto_si_frontend/requisitos.md`](projeto_si_frontend/requisitos.md): requisitos funcionais do frontend, captura de features e contratos HTTP.
 - [`projeto_si_experimentos/README.md`](projeto_si_experimentos/README.md): algoritmos avaliados, protocolos experimentais e comandos de reprodução dos benchmarks.
