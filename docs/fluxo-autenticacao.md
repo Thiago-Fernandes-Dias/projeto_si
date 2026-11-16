@@ -117,7 +117,7 @@ POST /api/enrollment
   - `currentPassword` obrigatória (`400`);
   - `newPassword` e `samples` com as mesmas regras do cadastro (`400`);
   - `newPassword !== currentPassword` (`400`);
-  - conta bloqueada ou senha atual incorreta → `401` (contabilizando falha);
+  - conta bloqueada → `401`; senha atual incorreta → `401` contabilizando a falha;
   - usuário inexistente ou senha atual inválida → `401` sem revelar qual campo falhou.
 - Transação:
   1. salva o hash anterior, `data_mudanca_senha` e `biometria_cadastrada_em` para compensação;
@@ -202,7 +202,7 @@ POST /api/enrollment
   - exige, sem `--force`, pelo menos `RETRAIN_MIN_NEW_SAMPLES = 5` amostras `Login` `Genuine` com `confianca >= threshold + 0.15` posteriores ao modelo ativo;
   - usa apenas `Cadastro` e `Login` `Genuine` de alta confiança; ignora `Impostor` e `UNCERTAIN`;
   - se o modelo ativo é `AdaptiveM2005Alg` da mesma variante, faz **adaptação incremental** (novas amostras + Welford + janela deslizante);
-  - caso contrário, reconstrói o modelo a partir da janela de até `RETRAIN_GENUINE_WINDOW = 50` amostras genuínas;
+  - caso contrário, reconstrói o modelo com as amostras genuínas posteriores à troca de senha; para o `M2005Alg` legado, limita a galeria a `RETRAIN_GENUINE_WINDOW = 50` amostras;
   - persiste a próxima versão em `modelos` + `.joblib`/SHA-256 + `active_version.json`.
 - A ML API apenas **lê** `amostras`; a gravação de novas linhas no login é exclusiva do Backend .NET.
 
@@ -210,7 +210,7 @@ POST /api/enrollment
 
 ## 4. Persistência e Integridade dos Modelos
 
-- Diretório: `models_data/<user_id>/v<version>.joblib`; cada versão tem `.meta.json` e hash SHA-256 registrado em `modelos`.
+- Diretório: `models_data/<user_id>/v<version>_<sha256>.joblib`; cada versão tem um `.joblib.meta.json` com o hash SHA-256, a versão do scikit-learn, o gatilho e as estatísticas de treino. A tabela `modelos` guarda apenas versão, algoritmo, caminho do artefato e data de criação; o hash é validado no carregamento.
 - A versão ativa é a maior `versao` com `criado_em >= data_mudanca_senha`, respeitando `active_version.json`.
 - `activate_model <username> <version>` permite rollback/ativação manual:
   ```bash
@@ -225,7 +225,7 @@ POST /api/enrollment
 
 - **`rawTimings`:** o frontend inclui `rawTimings` em `KeystrokeSample`, mas o backend o ignora (`AmostraDigitacaoRequest` usa apenas `Repetition`, `Features`, `TextEntered` e `TotalDurationMs`). Nada de `rawTimings` é persistido; a ML API recebe somente vetores posicionais.
 - **Sobreposição de teclas (`UD < 0`):** o frontend exige `KEY_DOWN → KEY_UP → KEY_DOWN` e recusa sobreposição; o backend e a ML API aceitam matematicamente `UD ∈ [-5, 5]` s. A restrição mais forte é a do frontend.
-- **Senha:** o frontend e o backend aplicam as mesmas regras (8–64 caracteres, sem acentos); a mensagem de erro do backend é exibida na UI.
+- **Senha:** o backend valida apenas o tamanho (8–64 caracteres); o frontend aplica a mesma faixa e ainda bloqueia letras acentuadas/teclas mortas (exceto `ç`/`Ç`) para garantir a captura de `KEY_DOWN`/`KEY_UP`. A mensagem de erro do backend é exibida na UI.
 - **Username:** a pré-checagem é apenas informativa; a unicidade real é garantida por `POST /api/register` (`409`).
 - **Credenciais inválidas no login:** o backend retorna `200` com `decision: "INVALID_CREDENTIALS"` em vez de `401`, para não revelar se o usuário existe.
 - **JWT:** só é emitido em decisão `GENUINE`; após troca de senha, tokens antigos são recusados por `GET /api/session`.
