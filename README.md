@@ -34,8 +34,8 @@ O classificador de produção é o **`M2005_IDB`** — *Improved Double Parallel
 - **Submodelo deslizante (`window_size = 50`):** mantém uma fila FIFO com as 50 amostras genuínas mais recentes e calcula média, mediana e desvio-padrão por dígrafo (`DigraphsMetrics`).
 - **Submodelo crescente incremental (Welford):** acumula média e desvio-padrão em memória constante `O(1)` sobre todo o histórico genuíno desde o cadastro, evitando deriva e esquecimento catastrófico.
 - **Escore final:** média aritmética dos escores dos dois submodelos. Cada atributo recebe *hit* quando cai no intervalo de tolerância construído a partir de média/mediana/desvio-padrão do dígrafo.
-- **Limiar por usuário:** calibrado a partir dos scores da galeria genuína com `min` ou `min_non_outlier` (descarta scores abaixo de `média - 2.5 × desvio-padrão`), limitado ao teto base `0.7`. A recalibração ocorre a cada retreinamento (`dynamic_threshold=True`).
-- **Treinamento One-Class:** utiliza exclusivamente amostras genuínas do próprio usuário (*anomaly detector*). Amostras de impostores e `UNCERTAIN` não entram no retreinamento.
+- **Limiar por usuário:** calibrado a partir dos scores da galeria genuína com `min` ou `min_non_outlier` (descarta scores abaixo de `média - 2.5 × desvio-padrão`), sem teto fixo. A recalibração ocorre a cada retreinamento (`dynamic_threshold=True`).
+- **Treinamento One-Class:** utiliza exclusivamente amostras genuínas do próprio usuário (*anomaly detector*). Amostras de impostores não entram no retreinamento.
 
 ### Resultados que embasaram a escolha
 

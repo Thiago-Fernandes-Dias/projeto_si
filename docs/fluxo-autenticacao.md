@@ -17,7 +17,7 @@ O desenho atual usa **treinamento one-class** (somente amostras genuínas), cada
 ### Algoritmo de decisão
 
 - **`M2005_IDB`** (`AdaptiveM2005Alg`, `variant="idb"`): média aritmética de um submodelo deslizante (janela de 50 amostras genuínas) e de um submodelo crescente incremental (Welford, memória `O(1)`).
-- **Limiar por usuário:** calibrado com `min`/`min_non_outlier` sobre os scores da galeria genuína, limitado ao teto `0.7`, com recalibração dinâmica após retreinamento.
+- **Limiar por usuário:** calibrado com `min`/`min_non_outlier` sobre os scores da galeria genuína, sem teto fixo, com recalibração dinâmica após retreinamento.
 - **Resultado experimental:** CMU `BACC = 0.8909`, `FRR = 15.24%`, `FAR = 6.58%`; KeyRecs `BACC = 0.7980`, `FRR = 9.03%`, `FAR = 31.37%` (52 experimentos em `projeto_si_experimentos`).
 
 ---
@@ -184,7 +184,7 @@ POST /api/enrollment
   - carrega o `.joblib` validando SHA-256 (erro de integridade → `500`);
   - valida o vetor posicional `3n - 2` e a dimensão esperada (`400`);
   - classifica com `M2005_IDB`, usando o limiar calibrado do modelo;
-  - calcula `label_for(confidence, threshold)` com margem `0.15`;
+  - calcula `label_for(confidence, threshold)` diretamente pelo limiar;
   - retorna `shouldRecordForRetraining = (decision == GENUINE and label == GENUINE)`;
   - **não grava nada em `amostras`**.
 - Rate limit: `ScopedRateThrottle` (`120/minute` por padrão; configurável por `BIOMETRICS_AUTH_THROTTLE_RATE`).
@@ -199,8 +199,8 @@ POST /api/enrollment
   ```
 - `retrain_user`:
   - adquire `select_for_update(skip_locked=True)`;
-  - exige, sem `--force`, pelo menos `RETRAIN_MIN_NEW_SAMPLES = 5` amostras `Login` `Genuine` com `confianca >= threshold + 0.15` posteriores ao modelo ativo;
-  - usa apenas `Cadastro` e `Login` `Genuine` de alta confiança; ignora `Impostor` e `UNCERTAIN`;
+  - exige, sem `--force`, pelo menos `RETRAIN_MIN_NEW_SAMPLES = 5` amostras `Login` `Genuine` com `confianca >= threshold` posteriores ao modelo ativo;
+  - usa apenas amostras `Cadastro` e `Login` `Genuine`; ignora `Impostor`;
   - se o modelo ativo é `AdaptiveM2005Alg` da mesma variante, faz **adaptação incremental** (novas amostras + Welford + janela deslizante);
   - caso contrário, reconstrói o modelo com as amostras genuínas posteriores à troca de senha; para o `M2005Alg` legado, limita a galeria a `RETRAIN_GENUINE_WINDOW = 50` amostras;
   - persiste a próxima versão em `modelos` + `.joblib`/SHA-256 + `active_version.json`.
